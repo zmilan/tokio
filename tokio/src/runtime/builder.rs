@@ -1,14 +1,9 @@
-use crate::executor::blocking::{Pool, PoolWaiter};
-use crate::executor::current_thread::CurrentThread;
-#[cfg(feature = "rt-full")]
-use crate::executor::thread_pool;
-use crate::net::driver::Reactor;
-use crate::runtime::{Runtime, Kind};
-use crate::timer::clock::Clock;
-use crate::timer::timer::Timer;
+use crate::loom::sync::Arc;
+#[cfg(feature = "blocking")]
+use crate::runtime::blocking;
+use crate::runtime::{io, timer, Runtime};
 
-use std::sync::Arc;
-use std::{fmt, io};
+use std::fmt;
 
 /// Builds Tokio Runtime with custom configuration values.
 ///
@@ -27,7 +22,7 @@ use std::{fmt, io};
 ///
 /// ```
 /// use tokio::runtime::Builder;
-/// use tokio::timer::clock::Clock;
+/// use tokio::time::clock::Clock;
 ///
 /// fn main() {
 ///     // build Runtime
@@ -43,8 +38,8 @@ use std::{fmt, io};
 /// }
 /// ```
 pub struct Builder {
-    /// When `true`, use the current-thread executor.
-    current_thread: bool,
+    /// The task execution model to use.
+    kind: Kind,
 
     /// The number of worker threads.
     ///
@@ -58,14 +53,29 @@ pub struct Builder {
     thread_stack_size: Option<usize>,
 
     /// Callback to run after each thread starts.
-    after_start: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_start: Option<Callback>,
 
     /// To run before each worker thread stops
-    before_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+    before_stop: Option<Callback>,
 
     /// The clock to use
-    clock: Clock,
+    clock: timer::Clock,
 }
+
+#[derive(Debug)]
+enum Kind {
+    Shell,
+    #[cfg(feature = "rt-current-thread")]
+    CurrentThread,
+    #[cfg(feature = "rt-full")]
+    ThreadPool,
+}
+
+#[cfg(not(loom))]
+type Callback = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(loom)]
+type Callback = Arc<Box<dyn Fn() + Send + Sync>>;
 
 impl Builder {
     /// Returns a new runtime builder initialized with default configuration
@@ -74,8 +84,8 @@ impl Builder {
     /// Configuration methods can be chained on the return value.
     pub fn new() -> Builder {
         Builder {
-            // Use the thread-pool executor by default
-            current_thread: false,
+            // No task execution by default
+            kind: Kind::Shell,
 
             // Default to use an equal number of threads to number of CPU cores
             num_threads: crate::loom::sys::num_cpus(),
@@ -91,7 +101,7 @@ impl Builder {
             before_stop: None,
 
             // Default clock
-            clock: Clock::new(),
+            clock: timer::Clock::default(),
         }
     }
 
@@ -119,12 +129,20 @@ impl Builder {
         self
     }
 
-    /// Use only the current thread for the runtime.
+    /// Use only the current thread for executing tasks.
     ///
     /// The network driver, timer, and executor will all be run on the current
     /// thread during `block_on` calls.
+    #[cfg(feature = "rt-current-thread")]
     pub fn current_thread(&mut self) -> &mut Self {
-        self.current_thread = true;
+        self.kind = Kind::CurrentThread;
+        self
+    }
+
+    /// Use a thread-pool for executing tasks.
+    #[cfg(feature = "rt-full")]
+    pub fn thread_pool(&mut self) -> &mut Self {
+        self.kind = Kind::ThreadPool;
         self
     }
 
@@ -190,6 +208,7 @@ impl Builder {
     ///     .build();
     /// # }
     /// ```
+    #[cfg(not(loom))]
     pub fn after_start<F>(&mut self, f: F) -> &mut Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -215,6 +234,7 @@ impl Builder {
     ///     .build();
     /// # }
     /// ```
+    #[cfg(not(loom))]
     pub fn before_stop<F>(&mut self, f: F) -> &mut Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -224,7 +244,7 @@ impl Builder {
     }
 
     /// Set the `Clock` instance that will be used by the runtime.
-    pub fn clock(&mut self, clock: Clock) -> &mut Self {
+    pub fn clock(&mut self, clock: timer::Clock) -> &mut Self {
         self.clock = clock;
         self
     }
@@ -245,20 +265,44 @@ impl Builder {
     /// });
     /// ```
     pub fn build(&mut self) -> io::Result<Runtime> {
-        if self.current_thread {
-            self.build_current_thread()
-        } else {
-            self.build_threadpool()
+        match self.kind {
+            Kind::Shell => self.build_shell(),
+            #[cfg(feature = "rt-current-thread")]
+            Kind::CurrentThread => self.build_current_thread(),
+            #[cfg(feature = "rt-full")]
+            Kind::ThreadPool => self.build_threadpool(),
         }
     }
 
-    fn build_current_thread(&mut self) -> io::Result<Runtime> {
-        // Create network driver
-        let net = Reactor::new()?;
-        let net_handles = vec![net.handle()];
+    fn build_shell(&mut self) -> io::Result<Runtime> {
+        use crate::runtime::Kind;
 
-        let timer = Timer::new_with_clock(net, self.clock.clone());
-        let timer_handles = vec![timer.handle()];
+        // Create network driver
+        let (net, handle) = io::create()?;
+        let net_handles = vec![handle];
+
+        let (_timer, handle) = timer::create(net, self.clock.clone());
+        let timer_handles = vec![handle];
+
+        Ok(Runtime {
+            kind: Kind::Shell,
+            net_handles,
+            timer_handles,
+            #[cfg(feature = "blocking")]
+            blocking_pool: self.build_blocking_pool().into(),
+        })
+    }
+
+    #[cfg(feature = "rt-current-thread")]
+    fn build_current_thread(&mut self) -> io::Result<Runtime> {
+        use crate::runtime::{CurrentThread, Kind};
+
+        // Create network driver
+        let (net, handle) = io::create()?;
+        let net_handles = vec![handle];
+
+        let (timer, handle) = timer::create(net, self.clock.clone());
+        let timer_handles = vec![handle];
 
         // And now put a single-threaded executor on top of the timer. When
         // there are no futures ready to do something, it'll let the timer or
@@ -267,26 +311,20 @@ impl Builder {
         let executor = CurrentThread::new(timer);
 
         // Blocking pool
-        let blocking_pool = PoolWaiter::from(Pool::default());
+        let blocking_pool = self.build_blocking_pool();
 
         Ok(Runtime {
             kind: Kind::CurrentThread(executor),
             net_handles,
             timer_handles,
-            blocking_pool,
+            blocking_pool: blocking_pool.into(),
         })
-    }
-
-    // Without rt-full, the "threadpool" variant just uses current-thread
-    #[cfg(not(feature = "rt-full"))]
-    fn build_threadpool(&mut self) -> io::Result<Runtime> {
-        self.build_current_thread()
     }
 
     #[cfg(feature = "rt-full")]
     fn build_threadpool(&mut self) -> io::Result<Runtime> {
-        use crate::net::driver;
-        use crate::timer::{clock, timer};
+        use crate::runtime::{Kind, ThreadPool};
+        use crate::time::clock;
         use std::sync::Mutex;
 
         let mut net_handles = Vec::new();
@@ -294,21 +332,21 @@ impl Builder {
         let mut timers = Vec::new();
 
         for _ in 0..self.num_threads {
-            // Create network driver
-            let net = Reactor::new()?;
-            net_handles.push(net.handle());
+            // Create network driver and handle
+            let (net, handle) = io::create()?;
+            net_handles.push(handle);
 
             // Create a new timer.
-            let timer = Timer::new_with_clock(net, self.clock.clone());
-            timer_handles.push(timer.handle());
+            let (timer, handle) = timer::create(net, self.clock.clone());
+            timer_handles.push(handle);
             timers.push(Mutex::new(Some(timer)));
         }
 
         // Get a handle to the clock for the runtime.
         let clock = self.clock.clone();
 
-        // Blocking pool
-        let blocking_pool = PoolWaiter::from(Pool::default());
+        // Create the blocking pool
+        let blocking_pool = self.build_blocking_pool();
 
         let pool = {
             let net_handles = net_handles.clone();
@@ -317,47 +355,51 @@ impl Builder {
             let after_start = self.after_start.clone();
             let before_stop = self.before_stop.clone();
 
-            let mut builder = thread_pool::Builder::new();
-            builder.num_threads(self.num_threads);
-            builder.name(&self.thread_name);
+            let around_worker = Arc::new(Box::new(move |index, next: &mut dyn FnMut()| {
+                // Configure the network driver
+                let _net = io::set_default(&net_handles[index]);
 
-            if let Some(stack_size) = self.thread_stack_size {
-                builder.stack_size(stack_size);
-            }
+                // Configure the clock
+                clock::with_default(&clock, || {
+                    // Configure the timer
+                    let _timer = timer::set_default(&timer_handles[index]);
 
-            builder
-                .around_worker(move |index, next| {
-                    // Configure the network driver
-                    let _net = driver::set_default(&net_handles[index]);
+                    // Call the start callback
+                    if let Some(after_start) = after_start.as_ref() {
+                        after_start();
+                    }
 
-                    // Configure the clock
-                    clock::with_default(&clock, || {
-                        // Configure the timer
-                        let _timer = timer::set_default(&timer_handles[index]);
+                    // Run the worker
+                    next();
 
-                        // Call the start callback
-                        if let Some(after_start) = after_start.as_ref() {
-                            after_start();
-                        }
-
-                        // Run the worker
-                        next();
-
-                        // Call the after call back
-                        if let Some(before_stop) = before_stop.as_ref() {
-                            before_stop();
-                        }
-                    })
+                    // Call the after call back
+                    if let Some(before_stop) = before_stop.as_ref() {
+                        before_stop();
+                    }
                 })
-                .build(move |index| timers[index].lock().unwrap().take().unwrap())
+            })
+                as Box<dyn Fn(usize, &mut dyn FnMut()) + Send + Sync>);
+
+            ThreadPool::new(
+                self.num_threads,
+                blocking_pool.clone(),
+                around_worker,
+                move |index| timers[index].lock().unwrap().take().unwrap(),
+            )
         };
 
         Ok(Runtime {
             kind: Kind::ThreadPool(pool),
             net_handles,
             timer_handles,
-            blocking_pool,
+            blocking_pool: blocking_pool.into(),
         })
+    }
+
+    #[cfg(feature = "blocking")]
+    fn build_blocking_pool(&self) -> Arc<blocking::Pool> {
+        // Create the blocking pool
+        blocking::Pool::new(self.thread_name.clone(), self.thread_stack_size)
     }
 }
 
@@ -370,7 +412,7 @@ impl Default for Builder {
 impl fmt::Debug for Builder {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("Builder")
-            .field("current_thread", &self.current_thread)
+            .field("kind", &self.kind)
             .field("num_threads", &self.num_threads)
             .field("thread_name", &self.thread_name)
             .field("thread_stack_size", &self.thread_stack_size)
