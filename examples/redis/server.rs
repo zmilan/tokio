@@ -9,6 +9,12 @@ use tokio::{
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+enum Response {
+    Ok,
+    Frame(Frame),
+    Error(String),
+}
+
 #[derive(Clone, Debug, Default)]
 struct Database {
     db: Arc<Mutex<HashMap<String, Frame>>>,
@@ -69,26 +75,27 @@ impl Database {
 
                     let frame = redis_protocol::decode::decode(full_message.as_bytes()).unwrap();
 
-                    println!("decoded frame {:?}", frame);
-
                     if let (Some(frame), _) = frame {
-                        match self.handle_request(frame).await {
-                            Ok(Response::Ok) => w.write_all("+Ok\r\n".as_bytes()).await?,
-                            Ok(Response::Frame(f)) => {
+                        match self.handle_request(frame).await? {
+                            Response::Ok => w.write_all("+OK\r\n".as_bytes()).await?,
+                            Response::Frame(f) => {
                                 let mut buf = vec![0u8; 1024];
 
                                 redis_protocol::encode::encode(&mut buf, &f).unwrap();
 
                                 w.write_all(&buf[..]).await?;
                             }
-                            Ok(Response::Error(e)) => unimplemented!(),
-                            Err(_e) => {
-                                unimplemented!("implement error message");
+                            Response::Error(e) => {
+                                let error = format!("-{}\r\n", e);
+                                w.write_all(error.as_bytes()).await?;
                             }
                         }
                     }
                 }
-                _ => unimplemented!("Only array's are supported"),
+                _ => {
+                    w.write_all("-only 'set' and 'get' commands are supported\r\n".as_bytes())
+                        .await?
+                }
             }
         } else {
             eprintln!("Connection closed early");
@@ -104,8 +111,8 @@ impl Database {
             if let Some(Frame::BulkString(s)) = frames.next() {
                 let cmd = String::from_utf8_lossy(&s[..]).into_owned();
 
-                match cmd.to_uppercase().as_str() {
-                    "GET" => {
+                match cmd.to_lowercase().as_str() {
+                    "get" => {
                         let key = if let Some(Frame::BulkString(s)) = frames.next() {
                             String::from_utf8_lossy(&s[..]).into_owned()
                         } else {
@@ -121,17 +128,21 @@ impl Database {
                         }
                     }
 
-                    "SET" => {
+                    "set" => {
                         let key = if let Some(Frame::BulkString(s)) = frames.next() {
                             String::from_utf8_lossy(&s[..]).into_owned()
                         } else {
-                            unimplemented!("expected bulkstring for key");
+                            return Ok(Response::Error(
+                                "wrong number of arguments for 'set' command".into(),
+                            ));
                         };
 
                         let value = if let Some(frame) = frames.next() {
                             frame
                         } else {
-                            unimplemented!("PUT expects a value");
+                            return Ok(Response::Error(
+                                "wrong number of arguments for 'set' command".into(),
+                            ));
                         };
 
                         let mut db = self.db.lock().await;
@@ -149,10 +160,4 @@ impl Database {
             unimplemented!("only outter array frame types are accepted.")
         }
     }
-}
-
-enum Response {
-    Ok,
-    Frame(Frame),
-    Error(String),
 }
