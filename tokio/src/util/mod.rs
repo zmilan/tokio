@@ -13,3 +13,6 @@ cfg_rt_threaded! {
     mod try_lock;
     pub(crate) use try_lock::TryLock;
 }
+
+#[cfg(test)]
+pub(crate) mod test;
